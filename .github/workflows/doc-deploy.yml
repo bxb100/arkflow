@@ -11,7 +11,6 @@ jobs:
   build:
     name: Build Docusaurus
     runs-on: ubuntu-latest
-    working-directory: docs
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,14 +18,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-          cache: yarn
+          cache: npm
+          cache-dependency-path: ./docs/package-lock.json
 
       - name: Install dependencies
         working-directory: ./docs
-        run: yarn install --frozen-lockfile
+        run: npm install
       - name: Build website
         working-directory: ./docs
-        run: yarn build
+        run: npm run build
 
       - name: Upload Build Artifact
         working-directory: ./docs
