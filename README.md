@@ -2,8 +2,6 @@
 
 English | [中文](README_zh.md)
 
-**‼️Not production-ready, do not use in a production environment‼️**
-
 [![Rust](https://github.com/chenquan/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/chenquan/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 

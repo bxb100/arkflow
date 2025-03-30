@@ -2,7 +2,6 @@
 
 [English](README.md) | 中文
 
-**‼️生产未就绪，请勿用于生产环境‼️**
 
 [![Rust](https://github.com/chenquan/arkflow/actions/workflows/rust.yml/badge.svg)](https://github.com/chenquan/arkflow/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
