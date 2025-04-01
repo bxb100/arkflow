@@ -2,6 +2,8 @@
 
 The SQL input component allows you to query data from various input sources using SQL.
 
+Reference to [SQL](../../category/sql).
+
 ## Configuration
 
 ### **select_sql**
@@ -89,7 +91,7 @@ options:
 - `name`: Optional connection name
 
   type: `string`
-- `file_path`: Path to DuckDB file
+- `path`: Path to DuckDB file
 
   type: `string`
 
@@ -112,7 +114,7 @@ options:
 - `name`: Optional connection name
 
   type: `string`
-- `file_path`: Path to SQLite file
+- `path`: Path to SQLite file
 
   type: `string`
 
