@@ -10,9 +10,9 @@ use flume::{Receiver, Sender};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
-
 /// MQTT input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MqttInputConfig {
@@ -40,9 +40,9 @@ pub struct MqttInputConfig {
 pub struct MqttInput {
     config: MqttInputConfig,
     client: Arc<Mutex<Option<AsyncClient>>>,
-    sender: Arc<Sender<MqttMsg>>,
-    receiver: Arc<Receiver<MqttMsg>>,
-    close_tx: broadcast::Sender<()>,
+    sender: Sender<MqttMsg>,
+    receiver: Receiver<MqttMsg>,
+    cancellation_token: CancellationToken,
 }
 
 enum MqttMsg {
@@ -54,13 +54,13 @@ impl MqttInput {
     /// Create a new MQTT input component
     pub fn new(config: MqttInputConfig) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<MqttMsg>(1000);
-        let (close_tx, _) = broadcast::channel(1);
+        let cancellation_token = CancellationToken::new();
         Ok(Self {
-            config: config.clone(),
+            config,
             client: Arc::new(Mutex::new(None)),
-            sender: Arc::new(sender),
-            receiver: Arc::new(receiver),
-            close_tx,
+            sender,
+            receiver,
+            cancellation_token,
         })
     }
 }
@@ -106,12 +106,14 @@ impl Input for MqttInput {
             })?;
         }
 
-        let client_arc = self.client.clone();
+        let client_arc = Arc::new(&self.client);
         let mut client_guard = client_arc.lock().await;
         *client_guard = Some(client);
 
-        let sender_arc = self.sender.clone();
-        let mut rx = self.close_tx.subscribe();
+        let sender_clone = Sender::clone(&self.sender);
+
+        let cancellation_token = self.cancellation_token.clone();
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -120,7 +122,7 @@ impl Input for MqttInput {
                             Ok(event) => {
                                 if let Event::Incoming(Packet::Publish(publish)) = event {
                                     // Add messages to the queue
-                                    match sender_arc.send_async(MqttMsg::Publish(publish)).await {
+                                    match sender_clone.send_async(MqttMsg::Publish(publish)).await {
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!("{}",e)
@@ -131,7 +133,7 @@ impl Input for MqttInput {
                             Err(e) => {
                                // Log the error and wait a short time before continuing
                                 error!("MQTT event loop error: {}", e);
-                                match sender_arc.send_async(MqttMsg::Err(Error::Disconnection)).await {
+                                match sender_clone.send_async(MqttMsg::Err(Error::Disconnection)).await {
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!("{}",e)
@@ -141,7 +143,7 @@ impl Input for MqttInput {
                             }
                         }
                     }
-                    _ = rx.recv() => {
+                    _ = cancellation_token.cancelled() => {
                         break;
                     }
                 }
@@ -153,13 +155,13 @@ impl Input for MqttInput {
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
         {
-            let client_arc = self.client.clone();
+            let client_arc = Arc::clone(&self.client);
             if client_arc.lock().await.is_none() {
                 return Err(Error::Disconnection);
             }
         }
+        let cancellation_token = self.cancellation_token.clone();
 
-        let mut close_rx = self.close_tx.subscribe();
         tokio::select! {
             result = self.receiver.recv_async() =>{
                 match result {
@@ -169,7 +171,7 @@ impl Input for MqttInput {
                                  let payload = publish.payload.to_vec();
                             let msg = MessageBatch::new_binary(vec![payload])?;
                             Ok((msg, Arc::new(MqttAck {
-                                client: self.client.clone(),
+                                client: Arc::clone(&self.client),
                                 publish,
                             })))
                             },
@@ -183,7 +185,7 @@ impl Input for MqttInput {
                     }
                 }
             },
-            _ = close_rx.recv()=>{
+            _ = cancellation_token.cancelled()=>{
                 Err(Error::EOF)
             }
         }
@@ -191,10 +193,10 @@ impl Input for MqttInput {
 
     async fn close(&self) -> Result<(), Error> {
         // Send a shutdown signal
-        let _ = self.close_tx.send(());
+        let _ = self.cancellation_token.clone().cancel();
 
         // Disconnect the MQTT connection
-        let client_arc = self.client.clone();
+        let client_arc = Arc::clone(&self.client);
         let client_guard = client_arc.lock().await;
         if let Some(client) = &*client_guard {
             // Try to disconnect, but don't wait for the result
