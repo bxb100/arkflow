@@ -204,7 +204,7 @@ impl ProtobufProcessor {
     }
 
     /// Convert Arrow format to Protobuf.
-    fn arrow_to_protobuf(&self, batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
+    fn arrow_to_protobuf(&self, batch: &MessageBatch) -> Result<Vec<Bytes>, Error> {
         // Create a new dynamic message
         let mut vec = Vec::with_capacity(batch.len());
         let len = batch.len();
@@ -358,10 +358,9 @@ impl Processor for ProtobufProcessor {
         match self._config.mode {
             ToType::ArrowToProtobuf => {
                 // Convert Arrow format to Protobuf.
-                let proto_data = self.arrow_to_protobuf(msg)?;
-                let new_msg = MessageBatch::new_binary(proto_data)?;
+                let proto_data = self.arrow_to_protobuf(&msg)?;
 
-                Ok(vec![new_msg])
+                Ok(vec![msg.new_binary_with_origin(proto_data)?])
             }
             ToType::ProtobufToArrow(ref c) => {
                 if msg.is_empty() {
