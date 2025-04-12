@@ -1,10 +1,11 @@
 //! Rust stream processing engine
 
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use thiserror::Error;
@@ -102,6 +103,27 @@ impl MessageBatch {
         let new_msg = RecordBatch::try_new(new_schema, columns)
             .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
         Ok(MessageBatch::new_arrow(new_msg))
+    }
+
+    pub fn remove_columns(&mut self, names: &HashSet<String>) {
+        let schema = self.schema();
+
+        let cap = schema.fields().len() - names.len();
+        let mut new_columns = Vec::with_capacity(cap);
+        let mut fields = Vec::with_capacity(cap);
+
+        for (i, col) in self.columns().iter().enumerate() {
+            let field = schema.field(i);
+            let name = field.name();
+            if names.contains(name.as_str()) {
+                continue;
+            }
+            new_columns.push(col.clone());
+            fields.push(field.clone());
+        }
+
+        let new_schema: SchemaRef = SchemaRef::new(Schema::new(fields));
+        self.0 = RecordBatch::try_new(new_schema, new_columns).unwrap();
     }
 
     pub fn from_json<T: Serialize>(value: &T) -> Result<Self, Error> {
