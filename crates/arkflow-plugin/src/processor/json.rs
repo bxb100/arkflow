@@ -3,11 +3,12 @@
 //! A processor for converting between binary data and the Arrow format
 
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, NullArray, StringArray, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, NullArray, StringArray,
+    UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -31,7 +32,12 @@ pub struct JsonToArrowProcessor {
 impl Processor for JsonToArrowProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
         let mut batches = Vec::with_capacity(msg_batch.len());
-        let result = msg_batch.to_binary(self.config.value_field.as_deref().unwrap_or("value"))?;
+        let result = msg_batch.to_binary(
+            self.config
+                .value_field
+                .as_deref()
+                .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
+        )?;
         for x in result {
             let record_batch = json_to_arrow(x)?;
             batches.push(record_batch)
@@ -57,8 +63,33 @@ pub struct ArrowToJsonProcessor;
 #[async_trait]
 impl Processor for ArrowToJsonProcessor {
     async fn process(&self, msg_batch: MessageBatch) -> Result<Vec<MessageBatch>, Error> {
-        let json_data = arrow_to_json(msg_batch)?;
-        Ok(vec![MessageBatch::new_binary(vec![json_data])?])
+        let json_data = arrow_to_json(msg_batch.clone())?;
+
+        let schema = msg_batch.schema();
+        let fields_vec: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+        let mut fields = Vec::new();
+        for field in fields_vec {
+            fields.push(field);
+        }
+
+        fields.push(Arc::new(Field::new(
+            DEFAULT_BINARY_VALUE_FIELD,
+            DataType::Binary,
+            false,
+        )));
+        let new_schema = Arc::new(Schema::new(fields));
+
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for i in 0..schema.fields().len() {
+            columns.push(msg_batch.column(i).clone());
+        }
+        let binary_data: Vec<&[u8]> = json_data.iter().map(|v| v.as_slice()).collect();
+        columns.push(Arc::new(BinaryArray::from(binary_data)));
+
+        let new_batch = RecordBatch::try_new(new_schema, columns)
+            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
+
+        Ok(vec![MessageBatch::new_arrow(new_batch)])
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -69,7 +100,7 @@ impl Processor for ArrowToJsonProcessor {
 fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
     // 解析JSON内容
     let json_value: Value = serde_json::from_slice(content)
-        .map_err(|e| Error::Process(format!("JSON解析错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("JSON parsing error: {}", e)))?;
 
     match json_value {
         Value::Object(obj) => {
@@ -77,7 +108,6 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
             let mut fields = Vec::new();
             let mut columns: Vec<ArrayRef> = Vec::new();
 
-            // 提取所有字段和值
             for (key, value) in obj {
                 match value {
                     Value::Null => {
@@ -131,28 +161,31 @@ fn json_to_arrow(content: &[u8]) -> Result<RecordBatch, Error> {
                 Error::Process(format!("Creating an Arrow record batch failed: {}", e))
             })
         }
-        _ => Err(Error::Process("输入必须是JSON对象".to_string())),
+        _ => Err(Error::Process(
+            "The input must be a JSON object".to_string(),
+        )),
     }
 }
 
 /// Convert Arrow format to JSON
-fn arrow_to_json(batch: MessageBatch) -> Result<Vec<u8>, Error> {
-    // 使用Arrow的JSON序列化功能
+fn arrow_to_json(batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
     let mut buf = Vec::new();
-    let mut writer = arrow::json::ArrayWriter::new(&mut buf);
+    let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
     writer
         .write(&batch)
-        .map_err(|e| Error::Process(format!("Arrow JSON序列化错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Arrow JSON Serialization error: {}", e)))?;
     writer
         .finish()
-        .map_err(|e| Error::Process(format!("Arrow JSON序列化完成错误: {}", e)))?;
+        .map_err(|e| Error::Process(format!("Arrow JSON Serialization Complete Error: {}", e)))?;
+    let json_str = String::from_utf8(buf)
+        .map_err(|e| Error::Process(format!("Conversion to UTF-8 string failed:{}", e)))?;
 
-    Ok(buf)
+    Ok(json_str.lines().map(|s| s.as_bytes().to_vec()).collect())
 }
 
 pub(crate) struct JsonToArrowProcessorBuilder;
 impl ProcessorBuilder for JsonToArrowProcessorBuilder {
-    fn build(&self, config: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(&self, config: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         if config.is_none() {
             return Err(Error::Config(
                 "JsonToArrow processor configuration is missing".to_string(),
@@ -165,7 +198,7 @@ impl ProcessorBuilder for JsonToArrowProcessorBuilder {
 }
 pub(crate) struct ArrowToJsonProcessorBuilder;
 impl ProcessorBuilder for ArrowToJsonProcessorBuilder {
-    fn build(&self, _: &Option<serde_json::Value>) -> Result<Arc<dyn Processor>, Error> {
+    fn build(&self, _: &Option<Value>) -> Result<Arc<dyn Processor>, Error> {
         Ok(Arc::new(ArrowToJsonProcessor))
     }
 }

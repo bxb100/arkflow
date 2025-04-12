@@ -2,8 +2,9 @@
 //!
 //! Send the processed data to the MQTT broker
 
+use crate::expr::{EvaluateExpr, Expr};
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatch};
+use arkflow_core::{Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, ClientError, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ pub struct MqttOutputConfig {
     /// Password (optional)
     pub password: Option<String>,
     /// Published topics
-    pub topic: String,
+    pub topic: Expr<String>,
     /// Quality of Service (0, 1, 2)
     pub qos: Option<u8>,
     /// Whether to use clean session
@@ -115,7 +116,11 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             .as_ref()
             .ok_or_else(|| Error::Connection("The MQTT client is not initialized".to_string()))?;
 
-        let value_field = self.config.value_field.as_deref().unwrap_or("value");
+        let value_field = self
+            .config
+            .value_field
+            .as_deref()
+            .unwrap_or(DEFAULT_BINARY_VALUE_FIELD);
 
         // Get the message content
         let payloads = match msg.to_binary(value_field) {
@@ -125,28 +130,32 @@ impl<T: MqttClient> Output for MqttOutput<T> {
             }
         };
 
-        for payload in payloads {
+        let topic = self.config.topic.evaluate_expr(&msg)?;
+
+        // Determine the QoS level
+        let qos_level = match self.config.qos {
+            Some(0) => QoS::AtMostOnce,
+            Some(1) => QoS::AtLeastOnce,
+            Some(2) => QoS::ExactlyOnce,
+            _ => QoS::AtLeastOnce, // The default is QoS 1
+        };
+
+        // Decide whether to keep the message
+        let retain = self.config.retain.unwrap_or(false);
+
+        for (i, payload) in payloads.into_iter().enumerate() {
             info!(
                 "Send message: {}",
                 &String::from_utf8_lossy((&payload).as_ref())
             );
 
-            // Determine the QoS level
-            let qos_level = match self.config.qos {
-                Some(0) => QoS::AtMostOnce,
-                Some(1) => QoS::AtLeastOnce,
-                Some(2) => QoS::ExactlyOnce,
-                _ => QoS::AtLeastOnce, // The default is QoS 1
-            };
-
-            // Decide whether to keep the message
-            let retain = self.config.retain.unwrap_or(false);
-
-            // Post a message
-            client
-                .publish(&self.config.topic, qos_level, retain, payload)
-                .await
-                .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
+            if let Some(topic_str) = topic.get(i) {
+                // Post a message
+                client
+                    .publish(topic_str, qos_level, retain, payload)
+                    .await
+                    .map_err(|e| Error::Process(format!("MQTT publishing failed: {}", e)))?;
+            }
         }
 
         Ok(())
@@ -308,7 +317,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
-            topic: "test/topic".to_string(),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: Some(1),
             clean_session: Some(true),
             keep_alive: Some(60),
@@ -329,7 +340,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: "test/topic".to_string(),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,
@@ -350,7 +363,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: "test/topic".to_string(),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,
@@ -382,7 +397,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: "test/topic".to_string(),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,
@@ -409,7 +426,9 @@ mod tests {
             client_id: "test_client".to_string(),
             username: None,
             password: None,
-            topic: "test/topic".to_string(),
+            topic: Expr::Value {
+                value: "test/topic".to_string(),
+            },
             qos: None,
             clean_session: None,
             keep_alive: None,

@@ -2,6 +2,8 @@
 //!
 //! The processor used to convert between Protobuf data and the Arrow format
 
+use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
+use arkflow_core::{Bytes, Error, MessageBatch, DEFAULT_BINARY_VALUE_FIELD};
 use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::array::{
@@ -14,14 +16,11 @@ use datafusion::parquet::data_type::AsBytes;
 use prost_reflect::prost::Message;
 use prost_reflect::prost_types::FileDescriptorSet;
 use prost_reflect::{DynamicMessage, MessageDescriptor, Value};
+use protobuf::Message as ProtobufMessage;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
-
-use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
-use arkflow_core::{Error, MessageBatch};
-use protobuf::Message as ProtobufMessage;
 
 /// Protobuf format conversion processor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +129,6 @@ impl ProtobufProcessor {
 
     /// Convert Protobuf data to Arrow format
     fn protobuf_to_arrow(&self, data: &[u8]) -> Result<RecordBatch, Error> {
-        // 解析Protobuf消息
         let proto_msg = DynamicMessage::decode(self.descriptor.clone(), data)
             .map_err(|e| Error::Process(format!("Protobuf message parsing failed: {}", e)))?;
 
@@ -206,19 +204,17 @@ impl ProtobufProcessor {
     }
 
     /// Convert Arrow format to Protobuf.
-    fn arrow_to_protobuf(&self, batch: MessageBatch) -> Result<Vec<u8>, Error> {
+    fn arrow_to_protobuf(&self, batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
         // Create a new dynamic message
-        let mut proto_msg = DynamicMessage::new(self.descriptor.clone());
+        let mut vec = Vec::with_capacity(batch.len());
+        let len = batch.len();
+        for _ in 0..len {
+            let proto_msg = DynamicMessage::new(self.descriptor.clone());
+            vec.push(proto_msg);
+        }
 
         // Get the Arrow schema.
         let schema = batch.schema();
-
-        // Ensure there is only one line of data.
-        if batch.num_rows() != 1 {
-            return Err(Error::Process(
-                "Only supports single-line Arrow data conversion to Protobuf.".to_string(),
-            ));
-        }
 
         for (i, field) in schema.fields().iter().enumerate() {
             let field_name = field.name();
@@ -229,9 +225,10 @@ impl ProtobufProcessor {
                 match proto_field.kind() {
                     prost_reflect::Kind::Bool => {
                         if let Some(value) = column.as_any().downcast_ref::<BooleanArray>() {
-                            if value.len() > 0 {
-                                proto_msg
-                                    .set_field_by_name(field_name, Value::Bool(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::Bool(value.value(j)));
+                                }
                             }
                         }
                     }
@@ -239,8 +236,10 @@ impl ProtobufProcessor {
                     | prost_reflect::Kind::Sint32
                     | prost_reflect::Kind::Sfixed32 => {
                         if let Some(value) = column.as_any().downcast_ref::<Int32Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::I32(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::I32(value.value(j)));
+                                }
                             }
                         }
                     }
@@ -248,66 +247,82 @@ impl ProtobufProcessor {
                     | prost_reflect::Kind::Sint64
                     | prost_reflect::Kind::Sfixed64 => {
                         if let Some(value) = column.as_any().downcast_ref::<Int64Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::I64(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::I64(value.value(j)));
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::Uint32 | prost_reflect::Kind::Fixed32 => {
                         if let Some(value) = column.as_any().downcast_ref::<UInt32Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::U32(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::U32(value.value(j)));
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::Uint64 | prost_reflect::Kind::Fixed64 => {
                         if let Some(value) = column.as_any().downcast_ref::<UInt64Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::U64(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::U64(value.value(j)));
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::Float => {
                         if let Some(value) = column.as_any().downcast_ref::<Float32Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::F32(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::F32(value.value(j)));
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::Double => {
                         if let Some(value) = column.as_any().downcast_ref::<Float64Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(field_name, Value::F64(value.value(0)));
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(field_name, Value::F64(value.value(j)));
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::String => {
                         if let Some(value) = column.as_any().downcast_ref::<StringArray>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(
-                                    field_name,
-                                    Value::String(value.value(0).to_string()),
-                                );
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(
+                                        field_name,
+                                        Value::String(value.value(j).to_string()),
+                                    );
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::Bytes => {
                         if let Some(value) = column.as_any().downcast_ref::<BinaryArray>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(
-                                    field_name,
-                                    Value::Bytes(value.value(0).to_vec().into()),
-                                );
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(
+                                        field_name,
+                                        Value::Bytes(value.value(j).to_vec().into()),
+                                    );
+                                }
                             }
                         }
                     }
                     prost_reflect::Kind::Enum(_) => {
                         if let Some(value) = column.as_any().downcast_ref::<Int32Array>() {
-                            if value.len() > 0 {
-                                proto_msg.set_field_by_name(
-                                    field_name,
-                                    Value::EnumNumber(value.value(0)),
-                                );
+                            for j in 0..value.len() {
+                                if let Some(msg) = vec.get_mut(j) {
+                                    msg.set_field_by_name(
+                                        field_name,
+                                        Value::EnumNumber(value.value(j)),
+                                    );
+                                }
                             }
                         }
                     }
@@ -321,12 +336,16 @@ impl ProtobufProcessor {
             }
         }
 
-        let mut buf = Vec::new();
-        proto_msg
-            .encode(&mut buf)
-            .map_err(|e| Error::Process(format!("Protobuf encoding failed: {}", e)))?;
-
-        Ok(buf)
+        Ok(vec
+            .into_iter()
+            .map(|proto_msg| {
+                let mut buf = Vec::new();
+                proto_msg
+                    .encode(&mut buf)
+                    .map_err(|e| Error::Process(format!("Protobuf encoding failed: {}", e)))?;
+                Ok(buf) // 修改这里，返回 Result<Vec<u8>, Error>
+            })
+            .collect::<Result<Vec<_>, Error>>()?)
     }
 }
 
@@ -340,7 +359,7 @@ impl Processor for ProtobufProcessor {
             ToType::ArrowToProtobuf => {
                 // Convert Arrow format to Protobuf.
                 let proto_data = self.arrow_to_protobuf(msg)?;
-                let new_msg = MessageBatch::new_binary(vec![proto_data])?;
+                let new_msg = MessageBatch::new_binary(proto_data)?;
 
                 Ok(vec![new_msg])
             }
@@ -350,7 +369,11 @@ impl Processor for ProtobufProcessor {
                 }
 
                 let mut batches = Vec::with_capacity(msg.len());
-                let result = msg.to_binary(c.value_field.as_deref().unwrap_or("value"))?;
+                let result = msg.to_binary(
+                    c.value_field
+                        .as_deref()
+                        .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
+                )?;
                 for x in result {
                     // Convert Protobuf messages to Arrow format.
                     let batch = self.protobuf_to_arrow(x)?;
