@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::DataFusionError;
+use datafusion::optimizer::OptimizerConfig;
 use datafusion::prelude::*;
+use datafusion::sql::parser::Statement;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -40,20 +43,29 @@ pub struct SqlProcessorConfig {
 /// SQL processor component
 pub struct SqlProcessor {
     config: SqlProcessorConfig,
+    pub statement: Statement,
 }
 
 impl SqlProcessor {
     /// Create a new SQL processor component.
     pub fn new(config: SqlProcessorConfig) -> Result<Self, Error> {
-        Ok(Self { config })
+        let ctx = Self::create_session_context()?;
+
+        let statement = ctx
+            .state()
+            .sql_to_statement(
+                &config.query,
+                ctx.state().options().sql_parser.dialect.as_str(),
+            )
+            .map_err(|e| Error::Process(format!("SQL query error: {}", e)))?;
+
+        Ok(Self { config, statement })
     }
 
     /// Execute SQL query
     async fn execute_query(&self, batch: MessageBatch) -> Result<RecordBatch, Error> {
         // Create a session context
-        let mut ctx = SessionContext::new();
-        datafusion_functions_json::register_all(&mut ctx)
-            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        let ctx = Self::create_session_context()?;
 
         let table_name = self
             .config
@@ -64,15 +76,10 @@ impl SqlProcessor {
             .map_err(|e| Error::Process(format!("Registration failed: {}", e)))?;
 
         // Execute the SQL query and collect the results.
-        let sql_options = SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
-        let df = ctx
-            .sql_with_options(&self.config.query, sql_options)
+        let df = self
+            .execute_query_with_statement(ctx)
             .await
-            .map_err(|e| Error::Process(format!("SQL query error: {}", e)))?;
-
+            .map_err(|e| Error::Process(format!("Execution query error: {}", e)))?;
         let result_batches = df
             .collect()
             .await
@@ -90,6 +97,32 @@ impl SqlProcessor {
             arrow::compute::concat_batches(&&result_batches[0].schema(), &result_batches)
                 .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?,
         )
+    }
+
+    async fn execute_query_with_statement(
+        &self,
+        ctx: SessionContext,
+    ) -> Result<DataFrame, DataFusionError> {
+        let sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
+        let plan = ctx
+            .state()
+            .statement_to_plan(self.statement.clone())
+            .await?;
+        sql_options.verify_plan(&plan)?;
+
+        ctx.execute_logical_plan(plan).await
+    }
+
+    /// Create a new session context with JSON functions registered
+    fn create_session_context() -> Result<SessionContext, Error> {
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx)
+            .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
+        Ok(ctx)
     }
 }
 
@@ -188,15 +221,9 @@ mod tests {
         let processor = SqlProcessor::new(SqlProcessorConfig {
             query: "INVALID SQL QUERY".to_string(),
             table_name: None,
-        })
-        .unwrap();
+        });
 
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
-
-        let result = processor.process(MessageBatch::new_arrow(batch)).await;
-        assert!(result.is_err());
+        assert!(processor.is_err());
     }
 
     #[tokio::test]
