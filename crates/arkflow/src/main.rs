@@ -21,7 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     output::init();
     processor::init();
     buffer::init();
-
     let mut cli = Cli::default();
     cli.parse()?;
     cli.run().await
