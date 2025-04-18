@@ -56,6 +56,8 @@ streams:
 
     output:
       type: "stdout"
+    error_output:
+      type: "stdout"
 ```
 
 2. 运行ArkFlow：
@@ -81,8 +83,10 @@ streams: # 流定义列表
     # ...
     output:     # 输出配置
     # ...
+    error_output: # 错误输出配置
+    # ...
     buffer:     # 缓冲配置
-    # ... 
+    # ...
 ```
 
 ### 输入组件
@@ -150,6 +154,28 @@ output:
   topic: output-topic
   client_id: arkflow-producer
 ```
+
+### 错误输出组件
+
+- **Kafka**：将错误数据写入 Kafka 主题
+- **MQTT**：将错误消息发布到 MQTT 主题
+- **HTTP**：通过 HTTP 发送错误数据
+- **标准输出**：将错误数据输出到控制台
+- **丢弃**：丢弃错误数据
+
+示例：
+
+```yaml
+error_output:
+  type: kafka
+  brokers:
+    - localhost:9092
+  topic: 
+    type: value
+    value: error-topic
+  client_id: error-arkflow-producer
+```
+
 
 ### 缓冲组件
 

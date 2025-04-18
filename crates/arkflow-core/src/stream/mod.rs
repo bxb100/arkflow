@@ -29,8 +29,9 @@ pub struct Stream {
     input: Arc<dyn Input>,
     pipeline: Arc<Pipeline>,
     output: Arc<dyn Output>,
+    error_output: Option<Arc<dyn Output>>,
     thread_num: u32,
-    pub buffer: Option<Arc<dyn Buffer>>,
+    buffer: Option<Arc<dyn Buffer>>,
 }
 
 impl Stream {
@@ -39,6 +40,7 @@ impl Stream {
         input: Arc<dyn Input>,
         pipeline: Pipeline,
         output: Arc<dyn Output>,
+        error_output: Option<Arc<dyn Output>>,
         buffer: Option<Arc<dyn Buffer>>,
         thread_num: u32,
     ) -> Self {
@@ -46,6 +48,7 @@ impl Stream {
             input,
             pipeline: Arc::new(pipeline),
             output,
+            error_output,
             buffer,
             thread_num,
         }
@@ -56,11 +59,21 @@ impl Stream {
         // Connect input and output
         self.input.connect().await?;
         self.output.connect().await?;
+        if let Some(ref error_output) = self.error_output {
+            error_output.connect().await?;
+        }
 
         let (input_sender, input_receiver) =
             flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
         let (output_sender, output_receiver) =
             flume::bounded::<(Vec<MessageBatch>, Arc<dyn Ack>)>(self.thread_num as usize * 4);
+        let (error_output_sender, error_output_receiver) = if self.error_output.is_none() {
+            (None, None)
+        } else {
+            let (error_output_sender, error_output_receiver) =
+                flume::bounded::<(MessageBatch, Arc<dyn Ack>)>(self.thread_num as usize * 4);
+            (Some(error_output_sender), Some(error_output_receiver))
+        };
 
         let tracker = TaskTracker::new();
 
@@ -90,14 +103,20 @@ impl Stream {
                 self.pipeline.clone(),
                 input_receiver.clone(),
                 output_sender.clone(),
+                error_output_sender.clone(),
             ));
         }
 
         // Close the output sender to notify all workers
         drop(output_sender);
+        drop(error_output_sender);
+
         // Output
         tracker.spawn(Self::do_output(output_receiver, self.output.clone()));
-
+        tracker.spawn(Self::do_error_output(
+            error_output_receiver,
+            self.error_output.clone(),
+        ));
         tracker.close();
         tracker.wait().await;
 
@@ -171,38 +190,6 @@ impl Stream {
         info!("Input stopped");
     }
 
-    async fn do_output(
-        output_receiver: Receiver<(Vec<MessageBatch>, Arc<dyn Ack>)>,
-        output: Arc<dyn Output>,
-    ) {
-        loop {
-            match output_receiver.recv_async().await {
-                Ok(msg) => {
-                    let size = &msg.0.len();
-                    let mut success_cnt = 0;
-                    for x in msg.0 {
-                        match output.write(x).await {
-                            Ok(_) => {
-                                success_cnt = success_cnt + 1;
-                            }
-                            Err(e) => {
-                                error!("{}", e);
-                            }
-                        }
-                    }
-
-                    // Confirm that the message has been successfully processed
-                    if *size == success_cnt {
-                        msg.1.ack().await;
-                    }
-                }
-                Err(_) => {
-                    break;
-                }
-            }
-        }
-        info!("Output stopped")
-    }
     async fn do_buffer(
         cancellation_token: CancellationToken,
         buffer: Arc<dyn Buffer>,
@@ -240,11 +227,13 @@ impl Stream {
         }
         info!("Buffer stopped");
     }
+
     async fn do_processor(
         i: u32,
         pipeline: Arc<Pipeline>,
         input_receiver: Receiver<(MessageBatch, Arc<dyn Ack>)>,
         output_sender: Sender<(Vec<MessageBatch>, Arc<dyn Ack>)>,
+        error_output_sender: Option<Sender<(MessageBatch, Arc<dyn Ack>)>>,
     ) {
         let i = i + 1;
         info!("Processor worker {} started", i);
@@ -252,7 +241,7 @@ impl Stream {
             match input_receiver.recv_async().await {
                 Ok((msg, ack)) => {
                     // Process messages through pipeline
-                    let processed = pipeline.process(msg).await;
+                    let processed = pipeline.process(msg.clone()).await;
 
                     // Process result messages
                     match processed {
@@ -263,7 +252,14 @@ impl Stream {
                             }
                         }
                         Err(e) => {
-                            ack.ack().await;
+                            if let Some(ref error_output_sender) = error_output_sender {
+                                if let Err(e) = error_output_sender.send_async((msg, ack)).await {
+                                    error!("Failed to send error message: {}", e);
+                                    break;
+                                }
+                            } else {
+                                ack.ack().await;
+                            }
                             error!("{}", e)
                         }
                     }
@@ -275,11 +271,93 @@ impl Stream {
         }
         info!("Processor worker {} stopped", i);
     }
+
+    async fn do_output(
+        output_receiver: Receiver<(Vec<MessageBatch>, Arc<dyn Ack>)>,
+        output: Arc<dyn Output>,
+    ) {
+        loop {
+            match output_receiver.recv_async().await {
+                Ok(msg) => {
+                    let size = &msg.0.len();
+                    let mut success_cnt = 0;
+                    for x in msg.0 {
+                        match output.write(x).await {
+                            Ok(_) => {
+                                success_cnt = success_cnt + 1;
+                            }
+                            Err(e) => {
+                                error!("{}", e);
+                            }
+                        }
+                    }
+
+                    // Confirm that the message has been successfully processed
+                    if *size == success_cnt {
+                        msg.1.ack().await;
+                    }
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+        info!("Output stopped")
+    }
+
+    async fn do_error_output(
+        error_output_receiver: Option<Receiver<(MessageBatch, Arc<dyn Ack>)>>,
+        error_output: Option<Arc<dyn Output>>,
+    ) {
+        let Some(error_output_receiver) = error_output_receiver else {
+            return;
+        };
+        let Some(error_output) = error_output else {
+            return;
+        };
+
+        loop {
+            let Ok(msg) = error_output_receiver.recv_async().await else {
+                break;
+            };
+
+            match error_output.write(msg.0).await {
+                Ok(_) => {
+                    msg.1.ack().await;
+                }
+                Err(e) => {
+                    error!("{}", e);
+                }
+            }
+        }
+        info!("Error output stopped")
+    }
+
     async fn close(&mut self) -> Result<(), Error> {
-        // Closing order: input -> pipeline -> buffer -> output
-        self.input.close().await?;
-        self.pipeline.close().await?;
-        self.output.close().await?;
+        // Closing order: input -> pipeline -> buffer -> output -> error output
+        if let Err(e) = self.input.close().await {
+            error!("Failed to close input: {}", e);
+        }
+
+        if let Err(e) = self.pipeline.close().await {
+            error!("Failed to close pipeline: {}", e);
+        }
+
+        if let Some(buffer) = &self.buffer {
+            if let Err(e) = buffer.close().await {
+                error!("Failed to close buffer: {}", e);
+            }
+        }
+
+        if let Err(e) = self.output.close().await {
+            error!("Failed to close output: {}", e);
+        }
+
+        if let Some(error_output) = &self.error_output {
+            if let Err(e) = error_output.close().await {
+                error!("Failed to close error output: {}", e);
+            }
+        }
         Ok(())
     }
 }
@@ -290,6 +368,7 @@ pub struct StreamConfig {
     pub input: crate::input::InputConfig,
     pub pipeline: crate::pipeline::PipelineConfig,
     pub output: crate::output::OutputConfig,
+    pub error_output: Option<crate::output::OutputConfig>,
     pub buffer: Option<crate::buffer::BufferConfig>,
 }
 
@@ -299,12 +378,24 @@ impl StreamConfig {
         let input = self.input.build()?;
         let (pipeline, thread_num) = self.pipeline.build()?;
         let output = self.output.build()?;
+        let error_output = if let Some(error_output_config) = &self.error_output {
+            Some(error_output_config.build()?)
+        } else {
+            None
+        };
         let buffer = if let Some(buffer_config) = &self.buffer {
             Some(buffer_config.build()?)
         } else {
             None
         };
 
-        Ok(Stream::new(input, pipeline, output, buffer, thread_num))
+        Ok(Stream::new(
+            input,
+            pipeline,
+            output,
+            error_output,
+            buffer,
+            thread_num,
+        ))
     }
 }
