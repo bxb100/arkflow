@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::udf;
 use ballista::prelude::SessionContextExt;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -382,6 +383,7 @@ impl SqlInput {
             SessionContext::new()
         };
 
+        udf::init(&mut ctx)?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
         Ok(ctx)
