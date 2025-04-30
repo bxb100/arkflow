@@ -56,6 +56,7 @@ aws-msk-iam-sasl-signer = { workspace = true }
 rdkafka = { workspace = true }
 rdkafka-sys = { workspace = true }
 sasl2-sys = { workspace = true }
+redis = { workspace = true }
 
 vrl = { workspace = true }
 
