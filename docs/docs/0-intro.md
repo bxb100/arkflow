@@ -1,10 +1,16 @@
 ---
 sidebar_position: 1
+logo: ./logo.svg
 ---
 
 # Introduction
 
 ArkFlow is a high-performance Rust stream processing engine that provides powerful data stream processing capabilities, supporting various input/output sources and processors.
+
+logo([Logo Usage Guidelines](./about-logo)）: 
+
+![ArkFlow logo](logo.svg)
+
 
 ## Core Features
 
