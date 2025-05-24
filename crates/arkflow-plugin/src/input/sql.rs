@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 use crate::udf;
 use ballista::prelude::SessionContextExt;
+use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::*;
@@ -33,12 +34,14 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use futures_util::stream::TryStreamExt;
+use object_store::aws::AmazonS3Builder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, info};
+use url::Url;
 
 const DEFAULT_NAME: &str = "flow";
 
@@ -86,6 +89,8 @@ struct AvroConfig {
     table_name: Option<String>,
     /// avro file path
     path: String,
+    /// object store config
+    object_store: Option<ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +99,8 @@ struct ArrowConfig {
     table_name: Option<String>,
     /// arrow file path
     path: String,
+    /// object store config
+    object_store: Option<ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +109,8 @@ struct JsonConfig {
     table_name: Option<String>,
     /// json file path
     path: String,
+    /// object store config
+    object_store: Option<ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +119,8 @@ struct CsvConfig {
     table_name: Option<String>,
     /// csv file path
     path: String,
+    /// object store config
+    object_store: Option<ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +129,8 @@ struct ParquetConfig {
     table_name: Option<String>,
     /// parquet file path
     path: String,
+    /// object store config
+    object_store: Option<ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +178,28 @@ struct PostgresSslConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ObjectStore {
+    S3(AwsS3Config),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwsS3Config {
+    /// S3 endpoint URL (optional, uses AWS default if not specified)
+    endpoint: Option<String>,
+    /// AWS region
+    region: String,
+    /// S3 bucket name
+    bucket_name: String,
+    /// AWS access key ID
+    access_key_id: String,
+    /// AWS secret access key
+    secret_access_key: String,
+    /// Allow HTTP connections (defaults to false for security)
+    #[serde(default = "default_allow_http")]
+    allow_http: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SqliteConfig {
     /// Table name (used in SQL queries)
     name: Option<String>,
@@ -181,7 +216,7 @@ pub struct SqlInput {
 impl SqlInput {
     pub fn new(sql_config: SqlInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-
+        info!("SqlInput::new:{:?}", sql_config);
         Ok(Self {
             sql_config,
             stream: Arc::new(Mutex::new(None)),
@@ -257,26 +292,41 @@ impl SqlInput {
         match self.sql_config.input_type {
             InputType::Avro(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
+                if let Some(object_store) = &c.object_store {
+                    self.object_store(ctx, object_store).await?;
+                }
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
             }
             InputType::Arrow(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
+                if let Some(object_store) = &c.object_store {
+                    self.object_store(ctx, object_store).await?;
+                }
                 ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
             }
             InputType::Json(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
+                if let Some(object_store) = &c.object_store {
+                    self.object_store(ctx, object_store).await?;
+                }
                 ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
             }
             InputType::Csv(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
+                if let Some(object_store) = &c.object_store {
+                    self.object_store(ctx, object_store).await?;
+                }
                 ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
             }
             InputType::Parquet(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
+                if let Some(object_store) = &c.object_store {
+                    self.object_store(ctx, object_store).await?;
+                }
                 ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
             }
@@ -373,6 +423,7 @@ impl SqlInput {
         .map_err(|e| Error::Process(format!("Registration input failed: {}", e)))
     }
 
+    /// Create a session context
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
         let mut ctx = if let Some(ballista) = &self.sql_config.ballista {
             SessionContext::remote(&ballista.remote_url)
@@ -386,6 +437,44 @@ impl SqlInput {
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
         Ok(ctx)
+    }
+
+    /// Create an object store
+    async fn object_store(
+        &self,
+        ctx: &SessionContext,
+        object_store: &ObjectStore,
+    ) -> Result<(), Error> {
+        match object_store {
+            ObjectStore::S3(aws_s3_config) => self.aws_s3_object_store(ctx, aws_s3_config).await,
+        }
+    }
+
+    /// Create an AWS S3 object store
+    async fn aws_s3_object_store(
+        &self,
+        ctx: &SessionContext,
+        aws_s3_config: &AwsS3Config,
+    ) -> Result<(), Error> {
+        let mut s3_builder = AmazonS3Builder::new()
+            .with_region(&aws_s3_config.region)
+            .with_bucket_name(&aws_s3_config.bucket_name)
+            .with_access_key_id(&aws_s3_config.access_key_id)
+            .with_secret_access_key(&aws_s3_config.secret_access_key)
+            .with_allow_http(aws_s3_config.allow_http);
+
+        if let Some(endpoint) = aws_s3_config.endpoint.as_ref() {
+            s3_builder = s3_builder.with_endpoint(endpoint);
+        }
+
+        let s3 = s3_builder
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create S3 client: {}", e)))?;
+        let s3_object_store_url = ObjectStoreUrl::parse("s3://")
+            .map_err(|e| Error::Config(format!("Failed to parse S3 URL: {}", e)))?;
+        let url: &Url = s3_object_store_url.as_ref();
+        ctx.register_object_store(url, Arc::new(s3));
+        Ok(())
     }
 }
 
@@ -412,6 +501,10 @@ pub fn init() -> Result<(), Error> {
     register_input_builder("sql", Arc::new(SqlInputBuilder))
 }
 
+fn default_allow_http() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +528,7 @@ mod tests {
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
+                object_store: None,
             }),
         };
         let input = SqlInput::new(config).unwrap();
@@ -450,6 +544,7 @@ mod tests {
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
+                object_store: None,
             }),
         };
         let input = SqlInput::new(config).unwrap();
@@ -478,6 +573,7 @@ mod tests {
             input_type: InputType::Json(JsonConfig {
                 table_name: Some("test_table".to_string()),
                 path,
+                object_store: None,
             }),
         };
         let input = SqlInput::new(config).unwrap();
