@@ -37,6 +37,7 @@ use futures_util::stream::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::http::HttpBuilder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,8 +184,9 @@ struct PostgresSslConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ObjectStore {
     S3(AwsS3Config),
-    GS(GoogleCloudStorageConfig),
-    AZ(MicrosoftAzureConfig),
+    Gs(GoogleCloudStorageConfig),
+    Az(MicrosoftAzureConfig),
+    Http(HttpConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +229,11 @@ struct MicrosoftAzureConfig {
     access_key: Option<String>,
     /// Azure container name
     container_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HttpConfig {
+    url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,7 +329,7 @@ impl SqlInput {
             InputType::Avro(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_avro(table_name, &c.path, AvroReadOptions::default())
                     .await
@@ -330,7 +337,7 @@ impl SqlInput {
             InputType::Arrow(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_arrow(table_name, &c.path, ArrowReadOptions::default())
                     .await
@@ -338,7 +345,7 @@ impl SqlInput {
             InputType::Json(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_json(table_name, &c.path, NdJsonReadOptions::default())
                     .await
@@ -346,7 +353,7 @@ impl SqlInput {
             InputType::Csv(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_csv(table_name, &c.path, CsvReadOptions::default())
                     .await
@@ -354,7 +361,7 @@ impl SqlInput {
             InputType::Parquet(ref c) => {
                 let table_name = c.table_name.as_deref().unwrap_or(DEFAULT_NAME);
                 if let Some(object_store) = &c.object_store {
-                    self.object_store(ctx, object_store).await?;
+                    self.object_store(ctx, object_store)?;
                 }
                 ctx.register_parquet(table_name, &c.path, ParquetReadOptions::default())
                     .await
@@ -469,20 +476,17 @@ impl SqlInput {
     }
 
     /// Create an object store
-    async fn object_store(
-        &self,
-        ctx: &SessionContext,
-        object_store: &ObjectStore,
-    ) -> Result<(), Error> {
+    fn object_store(&self, ctx: &SessionContext, object_store: &ObjectStore) -> Result<(), Error> {
         match object_store {
-            ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config).await,
-            ObjectStore::GS(config) => self.google_cloud_storage(ctx, config).await,
-            ObjectStore::AZ(config) => self.microsoft_azure_store(ctx, config).await,
+            ObjectStore::S3(config) => self.aws_s3_object_store(ctx, config),
+            ObjectStore::Gs(config) => self.google_cloud_storage(ctx, config),
+            ObjectStore::Az(config) => self.microsoft_azure_store(ctx, config),
+            ObjectStore::Http(config) => self.http_store(ctx, config),
         }
     }
 
     /// Create an AWS S3 object store
-    async fn aws_s3_object_store(
+    fn aws_s3_object_store(
         &self,
         ctx: &SessionContext,
         aws_s3_config: &AwsS3Config,
@@ -512,7 +516,7 @@ impl SqlInput {
         Ok(())
     }
 
-    async fn google_cloud_storage(
+    fn google_cloud_storage(
         &self,
         ctx: &SessionContext,
         config: &GoogleCloudStorageConfig,
@@ -551,7 +555,7 @@ impl SqlInput {
         Ok(())
     }
 
-    async fn microsoft_azure_store(
+    fn microsoft_azure_store(
         &self,
         ctx: &SessionContext,
         config: &MicrosoftAzureConfig,
@@ -580,6 +584,18 @@ impl SqlInput {
             .map_err(|e| Error::Config(format!("Failed to parse AZ URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(azure_storage));
+        Ok(())
+    }
+
+    fn http_store(&self, ctx: &SessionContext, config: &HttpConfig) -> Result<(), Error> {
+        let http_builder = HttpBuilder::new().with_url(&config.url);
+        let http_storage = http_builder
+            .build()
+            .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
+        let object_store_url = ObjectStoreUrl::parse(&config.url)
+            .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
+        let url: &Url = object_store_url.as_ref();
+        ctx.register_object_store(url, Arc::new(http_storage));
         Ok(())
     }
 }
