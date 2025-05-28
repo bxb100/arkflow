@@ -20,6 +20,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::data_type::AsBytes;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use thiserror::Error;
 
 pub mod buffer;
 pub mod cli;
+pub mod codec;
 pub mod config;
 pub mod engine;
 pub mod input;
@@ -73,8 +75,10 @@ pub enum Error {
     EOF,
 }
 
+#[derive(Clone)]
 pub struct Resource {
     pub temporary: HashMap<String, Arc<dyn Temporary>>,
+    pub input_names: RefCell<Vec<String>>,
 }
 
 pub type Bytes = Vec<u8>;
@@ -88,8 +92,14 @@ pub struct MessageBatch {
 
 impl MessageBatch {
     pub fn new_binary(content: Vec<Bytes>) -> Result<Self, Error> {
+        Self::new_binary_with_field_name(content, None)
+    }
+    pub fn new_binary_with_field_name(
+        content: Vec<Bytes>,
+        field_name: Option<&str>,
+    ) -> Result<Self, Error> {
         let fields = vec![Field::new(
-            DEFAULT_BINARY_VALUE_FIELD,
+            field_name.unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
             DataType::Binary,
             false,
         )];
@@ -112,6 +122,10 @@ impl MessageBatch {
 
     pub fn set_input_name(&mut self, input_name: Option<String>) {
         self.input_name = input_name;
+    }
+
+    pub fn get_input_name(&self) -> Option<String> {
+        self.input_name.clone()
     }
 
     pub fn new_binary_with_origin(&self, content: Vec<Bytes>) -> Result<Self, Error> {

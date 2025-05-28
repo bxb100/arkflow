@@ -11,19 +11,11 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
-mod join;
-pub mod memory;
-pub mod session_window;
-pub mod sliding_window;
-pub mod tumbling_window;
-pub(crate) mod window;
-
 use arkflow_core::Error;
 
+mod json;
+
 pub fn init() -> Result<(), Error> {
-    memory::init()?;
-    tumbling_window::init()?;
-    sliding_window::init()?;
-    session_window::init()?;
+    json::init()?;
     Ok(())
 }

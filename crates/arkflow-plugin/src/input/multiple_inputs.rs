@@ -17,16 +17,17 @@ use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultipleInputsConfig {
     inputs: Vec<InputConfig>,
 }
 
 struct MultipleInputs {
+    #[allow(unused)]
     input_name: Option<String>,
     inputs: Vec<Arc<dyn Input>>,
     sender: Sender<Msg>,
@@ -54,44 +55,47 @@ impl Input for MultipleInputs {
             self.task_tracker.spawn(async move {
                 loop {
                     tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        return;
-                    }
-                    result = input.read() => {
-                        match result {
-                            Ok((batch, ack)) => {
-                                if let Err(_) = sender.send_async(Msg::Message(batch, ack)).await {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                match e {
-                                    Error::Disconnection => {
-                                        let _ = sender.send_async(Msg::Err(e)).await;
+                        _ = cancellation_token.cancelled() => {
+                            return;
+                        }
+                        result = input.read() => {
+                            match result {
+                                Ok((batch, ack)) => {
+                                    if let Err(_) = sender.send_async(Msg::Message(batch, ack)).await {
                                         return;
                                     }
-                                    _ => {
-                                        if let Err(_) = sender.send_async(Msg::Err(e)).await {
+                                }
+                                Err(e) => {
+                                    match e {
+                                        Error::Disconnection|  Error::EOF => {
+                                            let _ = sender.send_async(Msg::Err(e)).await;
                                             return;
+                                        }
+                                        _ => {
+                                            if let Err(_) = sender.send_async(Msg::Err(e)).await {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                }
+                    }
                 }
             });
         }
+
+        self.task_tracker.close();
 
         Ok(())
     }
 
     async fn read(&self) -> Result<(MessageBatch, Arc<dyn Ack>), Error> {
+        let cancellation_token = self.cancellation_token.clone();
         tokio::select! {
-            _ = self.cancellation_token.cancelled() => {
-                Err(Error::Disconnection)
+            _ = cancellation_token.cancelled() => {
+                Err(Error::EOF)
             }
             result = self.receiver.recv_async() => {
                 match result {
@@ -109,6 +113,7 @@ impl Input for MultipleInputs {
         for input in &self.inputs {
             input.close().await?;
         }
+
         Ok(())
     }
 }
@@ -121,9 +126,24 @@ impl MultipleInputs {
     ) -> Result<Self, Error> {
         let (sender, receiver) = flume::unbounded();
         let mut inputs = Vec::with_capacity(config.inputs.len());
+        let mut input_names_mut = resource.input_names.borrow_mut();
         for x in config.inputs {
+            if let Some(name) = &x.name {
+                if name.is_empty() {
+                    return Err(Error::Config(
+                        "Multiple-inputs input configuration has empty input name".to_string(),
+                    ));
+                }
+                input_names_mut.push(name.clone());
+            }
             inputs.push(x.build(resource)?);
         }
+        let input_names_hash_set = input_names_mut.iter().cloned().collect::<HashSet<String>>();
+        if input_names_hash_set.len() != input_names_mut.len() {
+            return Err(Error::Config(
+                "Multiple-inputs input configuration has duplicate input names".to_string(),
+            ));
+        };
 
         Ok(Self {
             input_name: name.cloned(),
