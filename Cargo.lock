@@ -285,7 +285,7 @@ dependencies = [
  "num_cpus",
  "object_store",
  "once_cell",
- "prost-reflect",
+ "prost-reflect 0.16.2",
  "prost-types 0.14.1",
  "protobuf",
  "protobuf-parse",
@@ -6455,6 +6455,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-reflect"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89a3ac73ec9a9118131a4594c9d336631a07852220a1d0ae03ee36b04503a063"
+dependencies = [
+ "prost 0.14.1",
+ "prost-types 0.14.1",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9516,7 +9526,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "prost 0.13.5",
- "prost-reflect",
+ "prost-reflect 0.14.7",
  "psl",
  "psl-types",
  "publicsuffix",
