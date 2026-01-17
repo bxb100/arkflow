@@ -67,6 +67,16 @@ impl KafkaInput {
             consumer: Arc::new(RwLock::new(None)),
         })
     }
+    /// 将 Kafka 时间戳转换为 SystemTime
+    fn convert_kafka_timestamp(millis_since_epoch: i64) -> Option<SystemTime> {
+        if millis_since_epoch < 0 {
+            return None;
+        }
+
+        let millis_u64 = u64::try_from(millis_since_epoch).ok()?;
+        let duration = std::time::Duration::from_millis(millis_u64);
+        SystemTime::UNIX_EPOCH.checked_add(duration)
+    }
 }
 
 #[async_trait]
@@ -177,11 +187,10 @@ impl Input for KafkaInput {
                 // Add timestamp if available
                 let kafka_timestamp = kafka_message.timestamp();
                 if let Timestamp::CreateTime(millis_since_epoch) = kafka_timestamp {
-                    let duration = std::time::Duration::from_millis(millis_since_epoch as u64);
-                    let timestamp = SystemTime::UNIX_EPOCH + duration;
-                    record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                    if let Some(timestamp) = Self::convert_kafka_timestamp(millis_since_epoch) {
+                        record_batch = metadata::with_timestamp(record_batch, timestamp)?;
+                    }
                 }
-
                 // Add ingest time
                 let ingest_time = SystemTime::now();
                 record_batch = metadata::with_ingest_time(record_batch, ingest_time)?;
